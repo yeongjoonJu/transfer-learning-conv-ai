@@ -40,6 +40,9 @@ def build_input_from_segments_bart(dialog, tokenizer, special_tokens, seq_len=51
     if len(indices_ctx)  > seq_len:
         return None
 
+    # Encoder input : <s> <usr> Hello, How are you? <sys> yes, sure <usr> Thanks </s>
+    # Decoder input : <s> Good! </s>
+
     # Generate response
     indices_res = [bos] + dialog[-1]['sys'][1:] + [eos]
 
@@ -53,24 +56,21 @@ def build_input_from_segments_bart(dialog, tokenizer, special_tokens, seq_len=51
 
 def build_input_from_segments(dialog, tokenizer, special_tokens, separate_request=False, transformer=False, seq_len=512):
     """ Decorate the sequence with additional tokens. """
-    usr, sys, res, eos, pad = tokenizer.convert_tokens_to_ids(special_tokens)
+    usr, sys, res, eos, b_ctx, e_ctx, pad = tokenizer.convert_tokens_to_ids(special_tokens)
 
-    # Generate context
-    indices_ctx = []
-    token_type_ids = []
-    for turn in dialog[:-1]:
-        indices_ctx = indices_ctx + turn['usr'] + turn['sys']
-        token_type_ids = token_type_ids + [1]*len(turn['usr']) + [0]*len(turn['sys'])
-
-    indices_ctx = indices_ctx + dialog[-1]['usr']
-    token_type_ids = token_type_ids + [1]*len(dialog[-1]['usr'])
-    
-    # Generate response
-    indices_res = [res] + dialog[-1]['sys'][1:] + [eos]
-    token_type_ids = token_type_ids + [0]*len(indices_res)
+    # <ctx> <usr> ~~~ <sys> ~~~~ <usr> ~~~~ </ctx> <bos> ~~~ <eos>
     
     # pad for remaining sequence   
     if transformer:
+        # Generate context
+        indices_ctx = []
+        for turn in dialog[:-1]:
+            indices_ctx = indices_ctx + turn['usr'] + turn['sys']
+        indices_ctx = indices_ctx + dialog[-1]['usr']
+        
+        # Generate response
+        indices_res = [res] + dialog[-1]['sys'][1:] + [eos]
+
         if len(indices_ctx)  > seq_len:
             return None
         ctx_pad_len = seq_len - len(indices_ctx)
@@ -80,8 +80,22 @@ def build_input_from_segments(dialog, tokenizer, special_tokens, separate_reques
         indices_res += [pad] * (seq_len//2 - len(indices_res))
         return {'input': indices_ctx, 'attention_mask':attention_mask, 'dec_input': indices_res[:-1], 'output': indices_res_label[1:]}
     else:
+        # Generate context
+        indices_ctx = [b_ctx]
+        token_type_ids = [0]
+        for turn in dialog[:-1]:
+            indices_ctx = indices_ctx + turn['usr'] + turn['sys']
+            token_type_ids = token_type_ids + [1]*len(turn['usr']) + [0]*len(turn['sys'])
+        indices_ctx = indices_ctx + dialog[-1]['usr'] + [e_ctx]
+        token_type_ids = token_type_ids + [1]*len(dialog[-1]['usr']) + [0]
+
+        # Generate response
+        indices_res = [res] + dialog[-1]['sys'][1:] + [eos]
+        token_type_ids = token_type_ids + [0]*len(indices_res)
+
         if (len(indices_ctx) + len(indices_res)) > seq_len:
             return None
+            
         # Prevent pad from backpropagation
         ctx_sep = [-100] * len(indices_ctx)
         pad_len = seq_len - (len(indices_ctx)+len(indices_res))
@@ -96,7 +110,7 @@ def tokenize_multi_turn_dialog(dataset, tokenizer, special_tokens):
     """
     Format > [[{'usr': <user utterance>, 'sys': <system utterance>}, ...],...]
     """
-    usr, sys, res, eos, pad = tokenizer.convert_tokens_to_ids(special_tokens)
+    usr, sys, res, eos, _, _, pad = tokenizer.convert_tokens_to_ids(special_tokens)
 
     tokenized_dialogs = []
     for i, dialog in enumerate(dataset):

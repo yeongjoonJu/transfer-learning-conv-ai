@@ -6,7 +6,6 @@ import logging
 from pprint import pformat
 from argparse import ArgumentParser
 from collections import defaultdict
-from transformers.modeling_gpt2 import GPT2LMHeadModel
 from itertools import chain
 
 import torch
@@ -15,6 +14,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from ignite.engine import Engine, Events
 from ignite.handlers import ModelCheckpoint, global_step_from_engine
 from ignite.metrics import Accuracy, Loss, MetricsLambda, RunningAverage
+from ignite.metrics.nlp import Bleu
 from ignite.contrib.handlers import ProgressBar, PiecewiseLinear
 from ignite.contrib.handlers.tensorboard_logger import TensorboardLogger, OutputHandler, OptimizerParamsHandler
 from transformers import (AdamW, BartForConditionalGeneration, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer, BartTokenizer, BartModel,
@@ -42,13 +42,40 @@ def add_special_tokens_(model, tokenizer, attr_to_special_token):
     if num_added_tokens > 0:
         a = model.resize_token_embeddings(new_num_tokens=orig_num_tokens + num_added_tokens)
 
+def decode_logit_label(logits, label, tokenizer):
+    logits = torch.argmax(logits,dim=-1)
+    y_pred = []
+    y = []
+    for b in range(label.shape[0]):
+        target = label[b].tolist()
+        pred = logits[b].tolist()
+        bos_pos = target.index(tokenizer.bos_token_id)
+        try:
+            eos_pos = pred.index(tokenizer.eos_token_id)
+        except ValueError:
+            eos_pos = len(pred)-1
+        pred = tokenizer.convert_ids_to_tokens(pred[bos_pos+1:eos_pos])
+        y_pred.append(pred)
+ 
+        eos_pos = target.index(tokenizer.eos_token_id)
+        target = tokenizer.convert_ids_to_tokens(target[bos_pos+1:eos_pos])
+        y.append(target)
+        
+    return y_pred, y
+
+def flatten_logit_label(logits, label):
+    lm_logits_flat_shifted = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
+    lm_labels_flat_shifted = label[..., :-1].contiguous().view(-1)
+    return lm_logits_flat_shifted, lm_labels_flat_shifted
+        
+
 def train():
     parser = ArgumentParser()
     parser.add_argument("--dataset_path", type=str, default="data/pretrainDial.json", help="Path or url of the dataset. If empty download from S3.")
     parser.add_argument("--dataset_cache", type=str, default='./data/dataset_cache', help="Path or url of the dataset cache")
-    parser.add_argument("--model_checkpoint", type=str, default="gpt2", help="Path, url or short name of the model")
-    parser.add_argument("--train_batch_size", type=int, default=64, help="Batch size for training")
-    parser.add_argument("--valid_batch_size", type=int, default=32, help="Batch size for validation")
+    parser.add_argument("--model_checkpoint", type=str, default="gpt2", help="Path, url or short name of the model") # facebook/bart-base
+    parser.add_argument("--train_batch_size", type=int, default=32, help="Batch size for training")
+    parser.add_argument("--valid_batch_size", type=int, default=16, help="Batch size for validation")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Accumulate gradients on several steps")
     parser.add_argument("--lr", type=float, default=6.25e-5, help="Learning rate")
     parser.add_argument("--lm_coef", type=float, default=1.0, help="LM loss coefficient")
@@ -95,14 +122,14 @@ def train():
     if "bart" in args.model_checkpoint:
         # model.config.max_length = 256
         decoder_start_token = tokenizer.decode([model.config.decoder_start_token_id])
-        SPECIAL_TOKENS = ["<usr>", "<sys>", "<s>", "</s>", "<pad>"]
+        SPECIAL_TOKENS = ["<usr>", "<sys>", "<s>", "</s>", "", "", "<pad>"]
         ATTR_TO_SPECIAL_TOKEN = {'bos_token': "<s>", 'eos_token': "</s>", 'pad_token': '<pad>',
                                 'additional_special_tokens': ['<usr>', '<sys>']}
         
     else:
-        SPECIAL_TOKENS = ["<usr>", "<sys>", "<bos>", "<eos>", "<pad>"]
+        SPECIAL_TOKENS = ["<usr>", "<sys>", "<bos>", "<eos>", "<ctx>", "</ctx>", "<pad>"]
         ATTR_TO_SPECIAL_TOKEN = {'bos_token': '<bos>', 'eos_token': '<eos>', 'pad_token': '<pad>',
-                                'additional_special_tokens': ['<usr>', '<sys>']}
+                                'additional_special_tokens': ['<usr>', '<sys>','<ctx>','</ctx>']}
     
     # Add special tokens if they are notready added
     add_special_tokens_(model, tokenizer, ATTR_TO_SPECIAL_TOKEN)
@@ -134,6 +161,7 @@ def train():
             loss, *_ = model(input_ids, token_type_ids=token_type_ids, labels=lm_labels)
         else:
             input_ids, dec_ids, enc_attn_mask, dec_attn_mask, lm_labels = batch
+            # print(input_ids.shape, lm_labels.shape)
             loss, *_ = model(input_ids, decoder_input_ids=dec_ids, attention_mask=enc_attn_mask,\
                              decoder_attention_mask=dec_attn_mask, labels=lm_labels)
                 
@@ -161,12 +189,17 @@ def train():
                 input_ids, token_type_ids, lm_labels = batch
                 # if we dont send labels to model, it doesnt return losses
                 lm_logits, *_ = model(input_ids, token_type_ids=token_type_ids)
-                lm_logits_flat_shifted = lm_logits[..., :-1, :].contiguous().view(-1, lm_logits.size(-1))
-                lm_labels_flat_shifted = lm_labels[..., 1:].contiguous().view(-1)
+                try:
+                    bos_idx = input_ids[0].tolist().index(tokenizer.bos_token_id)
+                    logger.info(tokenizer.decode(input_ids[0,:bos_idx+1].tolist()))
+                    logger.info(re.sub(r'<pad>','',tokenizer.decode(torch.argmax(lm_logits[0,bos_idx:-1,:], dim=-1).tolist())))
+                    logger.info("----------------------------------------------------")
+                except TypeError:
+                    pass
             else:
                 input_ids, dec_ids, enc_attn_mask, dec_attn_mask, lm_labels = batch
                 # if we dont send labels to model, it doesnt return losses
-                _, lm_logits, *_ = model(input_ids, decoder_input_ids=dec_ids, attention_mask=enc_attn_mask,\
+                loss, lm_logits, *_ = model(input_ids, decoder_input_ids=dec_ids, attention_mask=enc_attn_mask,\
                             decoder_attention_mask=dec_attn_mask, labels=lm_labels)
                 try:
                     logger.info(re.sub(r'<pad>','',tokenizer.decode(torch.argmax(lm_logits[0,:-1,:], dim=-1).tolist())))
@@ -174,16 +207,17 @@ def train():
                     logger.info("----------------------------------------------------")
                 except TypeError:
                     pass
-                lm_logits_flat_shifted = lm_logits[...,:lm_labels.shape[-1],:].contiguous().view(-1, lm_logits.size(-1))
-                lm_labels_flat_shifted = lm_labels.contiguous().view(-1)
-        
-        return lm_logits_flat_shifted, lm_labels_flat_shifted    
+
+            # lm_logits = lm_logits[..., :-1, :].contiguous().view(-1, lm_logits.size(-1))
+            # lm_labels = lm_labels[..., :-1].contiguous().view(-1)
+            # return lm_logits_flat_shifted, lm_labels_flat_shifted
+            return lm_logits[...,:-1,:], lm_labels[..., 1:]
 
     evaluator = Engine(inference)
 
     # Attach evaluation to trainer: we evaluate when we start the training and at the end of each epoch
     trainer.add_event_handler(Events.EPOCH_COMPLETED, lambda _: evaluator.run(val_loader))
-    trainer.add_event_handler(Events.ITERATION_COMPLETED(every=8000), lambda _:evaluator.run(val_loader))
+    trainer.add_event_handler(Events.ITERATION_COMPLETED(every=4000), lambda _:evaluator.run(val_loader))
     if args.n_epochs < 1:
         trainer.add_event_handler(Events.COMPLETED, lambda _: evaluator.run(val_loader))
     if args.eval_before_start:
@@ -200,8 +234,10 @@ def train():
 
     # Prepare metrics - note how we compute distributed metrics
     RunningAverage(output_transform=lambda x: x).attach(trainer, "loss")
-    metrics = {"nll": Loss(torch.nn.CrossEntropyLoss(ignore_index=-100), output_transform=lambda x: (x[0], x[1]))}
-    metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, metrics["nll"], args)})
+    
+    # metrics = {"bleu_4": Bleu(smooth="smooth1", output_transform=lambda x: decode_logit_label(x[0],x[1], tokenizer))}
+    metrics={"nll": Loss(torch.nn.CrossEntropyLoss(ignore_index=-100), output_transform=lambda x: flatten_logit_label(x[0], x[1]))}
+    metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, metrics['nll'], args)})
     metrics["average_ppl"] = MetricsLambda(math.exp, metrics["average_nll"])
     for name, metric in metrics.items():
         metric.attach(evaluator, name)
