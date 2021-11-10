@@ -29,7 +29,7 @@ def make_input_id_mask(input_id, tokenizer, max_seq_len=512):
 
 def build_input_from_segments_bart(dialog, tokenizer, special_tokens, seq_len=512):
     """ Decorate the sequence with additional tokens. """
-    usr, sys, bos, eos, pad = tokenizer.convert_tokens_to_ids(special_tokens)
+    usr, sys, bos, eos, _, _, pad = tokenizer.convert_tokens_to_ids(special_tokens)
 
     # Generate context
     indices_ctx = [bos]
@@ -82,12 +82,12 @@ def build_input_from_segments(dialog, tokenizer, special_tokens, separate_reques
     else:
         # Generate context
         indices_ctx = [b_ctx]
-        token_type_ids = [0]
+        token_type_ids = [2]
         for turn in dialog[:-1]:
             indices_ctx = indices_ctx + turn['usr'] + turn['sys']
             token_type_ids = token_type_ids + [1]*len(turn['usr']) + [0]*len(turn['sys'])
         indices_ctx = indices_ctx + dialog[-1]['usr'] + [e_ctx]
-        token_type_ids = token_type_ids + [1]*len(dialog[-1]['usr']) + [0]
+        token_type_ids = token_type_ids + [1]*len(dialog[-1]['usr']) + [2]
 
         # Generate response
         indices_res = [res] + dialog[-1]['sys'][1:] + [eos]

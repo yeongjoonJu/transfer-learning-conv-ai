@@ -66,3 +66,28 @@ def make_logdir(model_name: str):
     logdir = os.path.join(
         'runs', current_time + '_' + socket.gethostname() + '_' + model_name)
     return logdir
+
+def calculate_turns(filename):
+    with open(filename, 'r', encoding='utf-8') as js:
+        dataset = json.load(js)
+    print('The number of dialogs:', len(dataset))
+
+    mean_seq_len = 0
+    max_seq_len = 0
+    
+    for i, dialog in enumerate(dataset):
+        print("\r%.4f" % ((i+1)/len(dataset)), end='')
+        seq_len = 0
+        for turn in dialog:
+            seq_len += len(turn['usr']) + len(turn['sys'])
+
+        seq_len += 4 # <ctx></ctx><s></s>
+        if max_seq_len < seq_len:
+            max_seq_len = seq_len
+        mean_seq_len += seq_len
+    
+    print('Max length of sequence of dialogue:', max_seq_len)
+    print('Mean length of sequence of dialogue:', mean_seq_len / len(dataset))
+
+if __name__=='__main__':
+    calculate_turns('data/dataset_cache_GPT2Tokenizer_train_ids.json')

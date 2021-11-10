@@ -65,6 +65,8 @@ def build_input_from_segments(persona, history, reply, tokenizer, lm_labels=Fals
     instance["lm_labels"] = [-100] * len(instance["input_ids"])
     if lm_labels:
         instance["lm_labels"] = ([-100] * sum(len(s) for s in sequence[:-1])) + [-100] + sequence[-1][1:]
+    print("input_ids", instance["input_ids"])
+    print("lm_labels", instance["lm_labels"])
     return instance
 
 
@@ -135,6 +137,8 @@ def train():
     parser.add_argument("--fp16", type=str, default="", help="Set to O0, O1, O2 or O3 for fp16 training (see apex documentation)")
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training (-1: not distributed)")
     args = parser.parse_args()
+
+    torch.cuda.set_device(0)
 
     # logging is set to INFO (resp. WARN) for main (resp. auxiliary) process. logger.info => log main process only, logger.warning => log all processes
     logging.basicConfig(level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)

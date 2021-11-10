@@ -74,7 +74,7 @@ def train():
     parser.add_argument("--dataset_path", type=str, default="data/pretrainDial.json", help="Path or url of the dataset. If empty download from S3.")
     parser.add_argument("--dataset_cache", type=str, default='./data/dataset_cache', help="Path or url of the dataset cache")
     parser.add_argument("--model_checkpoint", type=str, default="gpt2", help="Path, url or short name of the model") # facebook/bart-base
-    parser.add_argument("--train_batch_size", type=int, default=32, help="Batch size for training")
+    parser.add_argument("--train_batch_size", type=int, default=16, help="Batch size for training")
     parser.add_argument("--valid_batch_size", type=int, default=16, help="Batch size for validation")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Accumulate gradients on several steps")
     parser.add_argument("--lr", type=float, default=6.25e-5, help="Learning rate")
