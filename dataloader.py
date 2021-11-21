@@ -27,99 +27,91 @@ def make_input_id_mask(input_id, tokenizer, max_seq_len=512):
 
     return input_id, attention_mask
 
-def build_input_from_segments_bart(dialog, tokenizer, special_tokens, seq_len=512):
+def build_input_from_segments_bart(dialog, tokenizer, special_tokens, seq_len=512, separate=False):
     """ Decorate the sequence with additional tokens. """
-    usr, sys, bos, eos, _, _, pad = tokenizer.convert_tokens_to_ids(special_tokens)
+    """reference: https://github.com/haven-jeon/KoBART-chatbot/blob/main/kobart_chit_chat.py"""
+    bos, eos, pad = tokenizer.convert_tokens_to_ids(special_tokens)
 
     # Generate context
     indices_ctx = [bos]
     for turn in dialog[:-1]:
         indices_ctx = indices_ctx + turn['usr'] + turn['sys']
-    indices_ctx = indices_ctx + dialog[-1]['usr'] + [eos]
+    if not separate:
+        indices_ctx = indices_ctx + dialog[-1]['usr']
+    indices_ctx += [eos]
 
-    if len(indices_ctx)  > seq_len:
+    if len(indices_ctx) > seq_len:
         return None
 
-    # Encoder input : <s> <usr> Hello, How are you? <sys> yes, sure <usr> Thanks </s>
-    # Decoder input : <s> Good! </s>
+    # Generate response
+    if separate:
+        indices_res = [bos] + dialog[-1]['usr'] + dialog[-1]['sys'] + [eos]
+        encoder_input_id, encoder_attention_mask = make_input_id_mask(indices_ctx, tokenizer, seq_len)
+        decoder_input_id, decoder_attention_mask = make_input_id_mask(indices_res, tokenizer, seq_len)
+        labels = [-100]*(len(dialog[-1]['usr'])+1)
+        labels += dialog[-1]['sys'] +[eos]
+        labels += [-100]*(seq_len-len(labels))
+    else:
+        indices_res = [bos] + dialog[-1]['sys'] + [eos]
+        encoder_input_id, encoder_attention_mask = make_input_id_mask(indices_ctx, tokenizer, seq_len)
+        decoder_input_id, decoder_attention_mask = make_input_id_mask(indices_res, tokenizer, seq_len//2)
+        labels = indices_res.copy()
+        labels += [-100]*(seq_len//2-len(labels))
+
+    return {'input': encoder_input_id, 'attention_mask': encoder_attention_mask,\
+            'decoder_input_ids': decoder_input_id, 'decoder_attention_mask':decoder_attention_mask, 'labels':labels[1:]+[-100]}
+
+
+def build_input_from_segments(dialog, tokenizer, special_tokens, seq_len=512):
+    """ Decorate the sequence with additional tokens for GPT. """
+    eos, pad = tokenizer.convert_tokens_to_ids(special_tokens)
+
+    system_token_id = tokenizer.convert_tokens_to_ids(['system'])
+    user_token_id = tokenizer.convert_tokens_to_ids(['user'])
+    induction_token_id = tokenizer.convert_tokens_to_ids(['=>'])
+    
+    # Generate context
+    indices_ctx = []
+    ctx_token_types = []
+    for turn in dialog[:-1]:
+        indices_ctx = indices_ctx + turn['usr'] + turn['sys']
+        ctx_token_types = ctx_token_types + user_token_id*len(turn['usr']) + system_token_id*len(turn['sys'])
+    indices_ctx = indices_ctx + dialog[-1]['usr']
+    ctx_token_types = ctx_token_types + user_token_id*len(dialog[-1]['usr'])
 
     # Generate response
-    indices_res = [bos] + dialog[-1]['sys'][1:] + [eos]
+    indices_res = dialog[-1]['sys'] + [eos]
 
-    encoder_input_id, encoder_attention_mask = make_input_id_mask(indices_ctx, tokenizer, seq_len)
-    decoder_input_id, decoder_attention_mask = make_input_id_mask(indices_res, tokenizer, seq_len//2)
-    labels = indices_res[1:(seq_len//2+1)]
-    labels += [-100]*(seq_len//2-len(labels))
-    return {'input': encoder_input_id, 'attention_mask': encoder_attention_mask,\
-            'decoder_input_ids': decoder_input_id, 'decoder_attention_mask':decoder_attention_mask, 'labels':labels}
+    # context => response
+    source = indices_ctx + induction_token_id + indices_res
+    token_id = ctx_token_types + system_token_id*len(induction_token_id) + len(indices_res) * system_token_id
+    target = [-100]*len(indices_ctx) + [-100]*len(induction_token_id) + indices_res
 
-
-def build_input_from_segments(dialog, tokenizer, special_tokens, separate_request=False, transformer=False, seq_len=512):
-    """ Decorate the sequence with additional tokens. """
-    usr, sys, res, eos, b_ctx, e_ctx, pad = tokenizer.convert_tokens_to_ids(special_tokens)
-
-    # <ctx> <usr> ~~~ <sys> ~~~~ <usr> ~~~~ </ctx> <bos> ~~~ <eos>
-    
-    # pad for remaining sequence   
-    if transformer:
-        # Generate context
-        indices_ctx = []
-        for turn in dialog[:-1]:
-            indices_ctx = indices_ctx + turn['usr'] + turn['sys']
-        indices_ctx = indices_ctx + dialog[-1]['usr']
-        
-        # Generate response
-        indices_res = [res] + dialog[-1]['sys'][1:] + [eos]
-
-        if len(indices_ctx)  > seq_len:
-            return None
-        ctx_pad_len = seq_len - len(indices_ctx)
-        attention_mask = [1]*len(indices_ctx) + [0]*ctx_pad_len
-        indices_ctx += [pad] * ctx_pad_len
-        indices_res_label = indices_res + [-100] * (seq_len//2 - len(indices_res))
-        indices_res += [pad] * (seq_len//2 - len(indices_res))
-        return {'input': indices_ctx, 'attention_mask':attention_mask, 'dec_input': indices_res[:-1], 'output': indices_res_label[1:]}
+    if len(source) < seq_len:
+        source, attention_mask = make_input_id_mask(source, tokenizer, seq_len)
+        target += [-100]*(seq_len-len(target))
+        token_id += [0]*(seq_len-len(token_id))
     else:
-        # Generate context
-        indices_ctx = [b_ctx]
-        token_type_ids = [2]
-        for turn in dialog[:-1]:
-            indices_ctx = indices_ctx + turn['usr'] + turn['sys']
-            token_type_ids = token_type_ids + [1]*len(turn['usr']) + [0]*len(turn['sys'])
-        indices_ctx = indices_ctx + dialog[-1]['usr'] + [e_ctx]
-        token_type_ids = token_type_ids + [1]*len(dialog[-1]['usr']) + [2]
+        attention_mask = [1] * seq_len
+        source = source[-seq_len:]
+        target = target[-seq_len:]
+        token_id = token_id[-seq_len:]
 
-        # Generate response
-        indices_res = [res] + dialog[-1]['sys'][1:] + [eos]
-        token_type_ids = token_type_ids + [0]*len(indices_res)
-
-        if (len(indices_ctx) + len(indices_res)) > seq_len:
-            return None
-            
-        # Prevent pad from backpropagation
-        ctx_sep = [-100] * len(indices_ctx)
-        pad_len = seq_len - (len(indices_ctx)+len(indices_res))
-        token_type_ids = token_type_ids + [0]*pad_len
-        indices_res_label = indices_res + [-100] * pad_len
-        indices_res += [pad] * pad_len
-                
-        return {'input': indices_ctx + indices_res[:-1], 'token_type_ids': token_type_ids[:-1], 'output': ctx_sep[1:]+indices_res_label}
+    return {'input': source, 'token_type_ids': token_id, 'mask':attention_mask, 'output': target}
     
 
 def tokenize_multi_turn_dialog(dataset, tokenizer, special_tokens):
     """
     Format > [[{'usr': <user utterance>, 'sys': <system utterance>}, ...],...]
     """
-    usr, sys, res, eos, _, _, pad = tokenizer.convert_tokens_to_ids(special_tokens)
-
     tokenized_dialogs = []
     for i, dialog in enumerate(dataset):
         print('\r %.4f...' % ((i+1)/len(dataset)), end='')
         tokenized_turn = []
         for turn in dialog:
-            usr_ut = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(turn['usr']))
-            sys_ut = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(turn['sys']))
-            tokenized_turn.append({'usr': [usr] + usr_ut, 'sys': [sys] + sys_ut})
+            usr_ut = tokenizer.convert_tokens_to_ids(tokenizer.tokenize('user : ' + turn['usr']))
+            sys_ut = tokenizer.convert_tokens_to_ids(tokenizer.tokenize('system : ' + turn['sys']))
+            tokenized_turn.append({'usr': usr_ut, 'sys': sys_ut})
             
             # Save all dialogues per turn
             tokenized_dialogs.append(tokenized_turn.copy())
@@ -128,13 +120,16 @@ def tokenize_multi_turn_dialog(dataset, tokenizer, special_tokens):
     return tokenized_dialogs
 
 
-def get_dataset(tokenizer, dataset_path, special_tokens, split_rate, dataset_cache='./data/predial_cache'):
+def get_dataset(tokenizer, dataset_path, special_tokens, split_rate, seq_len, dataset_cache='./data/predial_cache', separate=False, model_name=None):
     """ Get dataset from json or cache."""
+
     dataset_cache = dataset_cache + '_' + type(tokenizer).__name__  # To avoid using GPT cache for GPT-2 and vice-versa
-    if dataset_cache and os.path.isfile(dataset_cache+'_train') and os.path.isfile(dataset_cache+'_val'):
-        print("Load tokenized dataset from cache at %s", dataset_cache)
-        train_dataset = torch.load(dataset_cache + '_train')
-        val_dataset = torch.load(dataset_cache + '_val')
+    sep = "_sep" if separate else ""
+    
+    if dataset_cache and os.path.isfile(dataset_cache+sep+'_train') and os.path.isfile(dataset_cache+sep+'_val'):
+        print("Load tokenized dataset from cache at %s", dataset_cache + sep)
+        train_dataset = torch.load(dataset_cache + sep + '_train')
+        val_dataset = torch.load(dataset_cache + sep + '_val')
     else:
         if os.path.exists(dataset_cache + '_train_ids.json'):
             with open(dataset_cache + '_train_ids.json', 'r', encoding='utf-8') as f:
@@ -163,32 +158,34 @@ def get_dataset(tokenizer, dataset_path, special_tokens, split_rate, dataset_cac
                 json.dump(val_dataset, f, ensure_ascii=True)
 
         len_train = len(train_dataset)
-
+        
         # Caching
         print('Tokenized dataset:', len(train_dataset) + len(val_dataset))
         print("Pad inputs and convert to Tensor")
+        print("Model:", model_name)
         dataset = train_dataset+val_dataset
+        print(len(train_dataset),'+',len(val_dataset),'=',len(train_dataset)+len(val_dataset))
 
         input_tensors = []
         output_tensors = []
-        if type(tokenizer).__name__[:4]=='GPT2':    
+        if "gpt2" in model_name:
             token_type_tensors = []
+            mask_tensors = []
             for dialog in tqdm(dataset):
-                dialog = build_input_from_segments(dialog, tokenizer, special_tokens, transformer=False)
-                if dialog is None:
-                    continue
+                dialog = build_input_from_segments(dialog, tokenizer, special_tokens, seq_len=seq_len)
                 input_tensors.append(torch.LongTensor(dialog['input']).unsqueeze(0))
                 output_tensors.append(torch.LongTensor(dialog['output']).unsqueeze(0))
+                mask_tensors.append(torch.LongTensor(dialog['mask']).unsqueeze(0))
                 token_type_tensors.append(torch.LongTensor(dialog['token_type_ids']).unsqueeze(0))
 
-            train_dataset = TensorDataset(torch.cat(input_tensors[:len_train]), torch.cat(token_type_tensors[:len_train]), torch.cat(output_tensors[:len_train]))
-            val_dataset = TensorDataset(torch.cat(input_tensors[len_train:]), torch.cat(token_type_tensors[len_train:]), torch.cat(output_tensors[len_train:]))
+            train_dataset = TensorDataset(torch.cat(input_tensors[:len_train]), torch.cat(token_type_tensors[:len_train]), torch.cat(mask_tensors[:len_train]), torch.cat(output_tensors[:len_train]))
+            val_dataset = TensorDataset(torch.cat(input_tensors[len_train:]), torch.cat(token_type_tensors[len_train:]), torch.cat(mask_tensors[len_train:]), torch.cat(output_tensors[len_train:]))
         else:
             enc_attn_tensors = []
             dec_attn_tensors = []
             dec_input_tensors = []
             for dialog in tqdm(dataset):
-                dialog = build_input_from_segments_bart(dialog, tokenizer, special_tokens)
+                dialog = build_input_from_segments_bart(dialog, tokenizer, special_tokens, separate=separate, seq_len=seq_len)
                 if dialog is None:
                     continue
                 input_tensors.append(torch.LongTensor(dialog['input']).unsqueeze(0))
@@ -206,6 +203,7 @@ def get_dataset(tokenizer, dataset_path, special_tokens, split_rate, dataset_cac
 
         print('\n======> Done!')
 
+        dataset_cache = dataset_cache + sep
         torch.save(train_dataset, dataset_cache+'_train')
         torch.save(val_dataset, dataset_cache+'_val')
 
@@ -214,7 +212,8 @@ def get_dataset(tokenizer, dataset_path, special_tokens, split_rate, dataset_cac
 
 def get_data_loaders(args, tokenizer, special_tokens, split_rate=0.05):
     """ Prepare the dataset for training and evaluation """
-    train_dataset, valid_dataset = get_dataset(tokenizer, args.dataset_path, special_tokens, split_rate, args.dataset_cache)
+    train_dataset, valid_dataset = get_dataset(tokenizer, args.dataset_path, special_tokens, split_rate, args.max_seq_len, \
+                                                 args.dataset_cache, separate=args.separate, model_name=args.model_checkpoint,)
 
     print("Build train and validation dataloaders")
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset) if args.distributed else None

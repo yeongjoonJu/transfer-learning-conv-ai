@@ -63,19 +63,13 @@ def decode_logit_label(logits, label, tokenizer):
         
     return y_pred, y
 
-def flatten_logit_label(logits, label):
-    lm_logits_flat_shifted = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
-    lm_labels_flat_shifted = label[..., :-1].contiguous().view(-1)
-    return lm_logits_flat_shifted, lm_labels_flat_shifted
-        
-
 def train():
     parser = ArgumentParser()
     parser.add_argument("--dataset_path", type=str, default="data/pretrainDial.json", help="Path or url of the dataset. If empty download from S3.")
     parser.add_argument("--dataset_cache", type=str, default='./data/dataset_cache', help="Path or url of the dataset cache")
     parser.add_argument("--model_checkpoint", type=str, default="gpt2", help="Path, url or short name of the model") # facebook/bart-base
-    parser.add_argument("--train_batch_size", type=int, default=16, help="Batch size for training")
-    parser.add_argument("--valid_batch_size", type=int, default=16, help="Batch size for validation")
+    parser.add_argument("--train_batch_size", type=int, default=32, help="Batch size for training")
+    parser.add_argument("--valid_batch_size", type=int, default=32, help="Batch size for validation")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Accumulate gradients on several steps")
     parser.add_argument("--lr", type=float, default=6.25e-5, help="Learning rate")
     parser.add_argument("--lm_coef", type=float, default=1.0, help="LM loss coefficient")
@@ -85,6 +79,9 @@ def train():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device (cuda or cpu)")
     parser.add_argument("--fp16", type=str, default="O2", help="Set to O0, O1, O2 or O3 for fp16 training (see apex documentation)")
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training (-1: not distributed)")
+    parser.add_argument("--separate", action='store_true', help="separate last user utterance")
+    parser.add_argument("--max_seq_len", type=int, default=512, help='max sequence length')
+    parser.add_argument("--ko", action='store_true', help="korean")
     args = parser.parse_args()
 
     # logging is set to INFO (resp. WARN) for main (resp. auxiliary) process. logger.info => log main process only, logger.warning => log all processes
@@ -116,20 +113,20 @@ def train():
     tokenizer = tokenizer_class.from_pretrained(args.model_checkpoint)
 
     # model_class = GPT2LMHeadModel if "gpt2" in args.model_checkpoint else OpenAIGPTLMHeadModel
+    print(args.device)
     model = model_class.from_pretrained(args.model_checkpoint, max_length=512)
     model.to(args.device)
 
     if "bart" in args.model_checkpoint:
         # model.config.max_length = 256
         decoder_start_token = tokenizer.decode([model.config.decoder_start_token_id])
-        SPECIAL_TOKENS = ["<usr>", "<sys>", "<s>", "</s>", "", "", "<pad>"]
-        ATTR_TO_SPECIAL_TOKEN = {'bos_token': "<s>", 'eos_token': "</s>", 'pad_token': '<pad>',
-                                'additional_special_tokens': ['<usr>', '<sys>']}
-        
+        SPECIAL_TOKENS = ["<s>", "</s>", "<pad>"]
+        ATTR_TO_SPECIAL_TOKEN = {'bos_token': "<s>", 'eos_token': "</s>", 'pad_token': '<pad>'}
+                                # 'additional_special_tokens': ['<usr>', '<sys>']}
     else:
-        SPECIAL_TOKENS = ["<usr>", "<sys>", "<bos>", "<eos>", "<ctx>", "</ctx>", "<pad>"]
-        ATTR_TO_SPECIAL_TOKEN = {'bos_token': '<bos>', 'eos_token': '<eos>', 'pad_token': '<pad>',
-                                'additional_special_tokens': ['<usr>', '<sys>','<ctx>','</ctx>']}
+        SPECIAL_TOKENS = ["<|endoftext|>", "<pad>"]
+        ATTR_TO_SPECIAL_TOKEN = {'bos_token': '<|endoftext|>', 'eos_token': '<|endoftext|>', 'pad_token': '<pad>'}
+                                # 'additional_special_tokens': ['<usr>', '<sys>','<ctx>','</ctx>']
     
     # Add special tokens if they are notready added
     add_special_tokens_(model, tokenizer, ATTR_TO_SPECIAL_TOKEN)
@@ -156,9 +153,9 @@ def train():
     def update(engine, batch):
         model.train()
         batch = tuple(input_tensor.long().to(args.device) for input_tensor in batch)
-        if len(batch)==3:
-            input_ids, token_type_ids, lm_labels = batch
-            loss, *_ = model(input_ids, token_type_ids=token_type_ids, labels=lm_labels)
+        if not args.transformer:
+            input_ids, token_type_ids, mask, lm_labels = batch
+            loss, *_ = model(input_ids, attention_mask=mask, token_type_ids=token_type_ids, labels=lm_labels)
         else:
             input_ids, dec_ids, enc_attn_mask, dec_attn_mask, lm_labels = batch
             # print(input_ids.shape, lm_labels.shape)
@@ -185,39 +182,41 @@ def train():
         model.eval()
         with torch.no_grad():
             batch = tuple(input_tensor.long().to(args.device) for input_tensor in batch)
-            if len(batch)==3:
-                input_ids, token_type_ids, lm_labels = batch
+            if not args.transformer:
+                input_ids, token_type_ids, mask, lm_labels = batch
                 # if we dont send labels to model, it doesnt return losses
-                lm_logits, *_ = model(input_ids, token_type_ids=token_type_ids)
+                lm_logits, *_ = model(input_ids, attention_mask=mask, token_type_ids=token_type_ids)
                 try:
-                    bos_idx = input_ids[0].tolist().index(tokenizer.bos_token_id)
-                    logger.info(tokenizer.decode(input_ids[0,:bos_idx+1].tolist()))
-                    logger.info(re.sub(r'<pad>','',tokenizer.decode(torch.argmax(lm_logits[0,bos_idx:-1,:], dim=-1).tolist())))
+                    logger.info(re.sub(r'<pad>', '', tokenizer.decode(input_ids[0,:-1].tolist())))
+                    logger.info("|||||||||||||||||||||||||||||||||||||||||||||")
+                    logger.info(re.sub(r'<pad>','',tokenizer.decode(torch.argmax(lm_logits[0,:-1,:], dim=-1).tolist())))
                     logger.info("----------------------------------------------------")
                 except TypeError:
                     pass
+                lm_logits_flat_shifted = lm_logits[..., :-1, :].contiguous().view(-1, lm_logits.size(-1))
+                lm_labels_flat_shifted = lm_labels[..., 1:].contiguous().view(-1)
             else:
                 input_ids, dec_ids, enc_attn_mask, dec_attn_mask, lm_labels = batch
                 # if we dont send labels to model, it doesnt return losses
                 loss, lm_logits, *_ = model(input_ids, decoder_input_ids=dec_ids, attention_mask=enc_attn_mask,\
                             decoder_attention_mask=dec_attn_mask, labels=lm_labels)
                 try:
-                    logger.info(re.sub(r'<pad>','',tokenizer.decode(torch.argmax(lm_logits[0,:-1,:], dim=-1).tolist())))
                     logger.info(re.sub(r'<pad>','',tokenizer.decode(dec_ids[0].tolist())))
+                    logger.info("|||||||||||||||||||||||||||||||||||||||||||||")
+                    logger.info(re.sub(r'<pad>','',tokenizer.decode(torch.argmax(lm_logits[0,:-1,:], dim=-1).tolist())))
                     logger.info("----------------------------------------------------")
                 except TypeError:
                     pass
+                lm_logits_flat_shifted = lm_logits.contiguous().view(-1, lm_logits.size(-1))
+                lm_labels_flat_shifted = lm_labels.contiguous().view(-1)
 
-            # lm_logits = lm_logits[..., :-1, :].contiguous().view(-1, lm_logits.size(-1))
-            # lm_labels = lm_labels[..., :-1].contiguous().view(-1)
-            # return lm_logits_flat_shifted, lm_labels_flat_shifted
-            return lm_logits[...,:-1,:], lm_labels[..., 1:]
+            return lm_logits_flat_shifted, lm_labels_flat_shifted
 
     evaluator = Engine(inference)
 
     # Attach evaluation to trainer: we evaluate when we start the training and at the end of each epoch
     trainer.add_event_handler(Events.EPOCH_COMPLETED, lambda _: evaluator.run(val_loader))
-    trainer.add_event_handler(Events.ITERATION_COMPLETED(every=4000), lambda _:evaluator.run(val_loader))
+    trainer.add_event_handler(Events.ITERATION_COMPLETED(every=5000), lambda _:evaluator.run(val_loader))
     if args.n_epochs < 1:
         trainer.add_event_handler(Events.COMPLETED, lambda _: evaluator.run(val_loader))
     if args.eval_before_start:
@@ -235,12 +234,14 @@ def train():
     # Prepare metrics - note how we compute distributed metrics
     RunningAverage(output_transform=lambda x: x).attach(trainer, "loss")
     
-    # metrics = {"bleu_4": Bleu(smooth="smooth1", output_transform=lambda x: decode_logit_label(x[0],x[1], tokenizer))}
-    metrics={"nll": Loss(torch.nn.CrossEntropyLoss(ignore_index=-100), output_transform=lambda x: flatten_logit_label(x[0], x[1]))}
-    metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, metrics['nll'], args)})
+    metrics = {"nll": Loss(torch.nn.CrossEntropyLoss(ignore_index=-100), output_transform=lambda x: (x[0], x[1])),
+               "accuracy": Accuracy(output_transform=lambda x: (x[0], x[1]))}
+    metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, metrics["nll"], args),
+                    "average_accuracy": MetricsLambda(average_distributed_scalar, metrics["accuracy"], args)})
     metrics["average_ppl"] = MetricsLambda(math.exp, metrics["average_nll"])
     for name, metric in metrics.items():
         metric.attach(evaluator, name)
+
 
     # On the main process: add progress bar, tensorboard, checkpoints and save model, configuration and tokenizer before we start to train
     if args.local_rank in [-1, 0]:
@@ -248,7 +249,8 @@ def train():
         pbar.attach(trainer, metric_names=["loss"])
         evaluator.add_event_handler(Events.COMPLETED, lambda _: pbar.log_message("Validation: %s" % pformat(evaluator.state.metrics)))
 
-        log_dir = make_logdir(args.model_checkpoint)
+        sep = "_sep" if args.separate else ""
+        log_dir = make_logdir(args.model_checkpoint + sep)
         tb_logger = TensorboardLogger(log_dir)
 
         tb_logger.attach(trainer, log_handler=OutputHandler(tag="training", metric_names=["loss"]), event_name=Events.ITERATION_COMPLETED)
